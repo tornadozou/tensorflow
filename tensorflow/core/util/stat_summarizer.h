@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,14 +16,14 @@ limitations under the License.
 #ifndef TENSORFLOW_UTIL_STAT_SUMMARIZER_H_
 #define TENSORFLOW_UTIL_STAT_SUMMARIZER_H_
 
+#include <stdlib.h>
+
 #include <cmath>
 #include <limits>
-#include <list>
 #include <map>
 #include <sstream>
 #include <string>
 
-#include <stdlib.h>
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/platform/types.h"
@@ -32,97 +32,192 @@ namespace tensorflow {
 
 class GraphDef;
 class StepStats;
+class NodeExecStats;
 
-static const int kNumValues = 1000;
-
-template <typename T>
+template <typename ValueType, typename HighPrecisionValueType = double>
 class Stat {
  public:
-  Stat<T>() { Reset(); }
+  void UpdateStat(ValueType v) {
+    if (count_ == 0) {
+      first_ = v;
+    }
 
-  void Reset() {
-    values_.clear();
-    min_value_ = std::numeric_limits<T>::max();
-    max_value_ = std::numeric_limits<T>::min();
-    avg_value_ = 0;
-    current_value_ = 0;
-    std_deviation_ = 0;
+    newest_ = v;
+    max_ = std::max(v, max_);
+    min_ = std::min(v, min_);
+    ++count_;
+    sum_ += v;
+    squared_sum_ += static_cast<HighPrecisionValueType>(v) * v;
   }
 
-  std::list<T> values_;
-  T min_value_;
-  T max_value_;
-  double avg_value_;
-  T current_value_;
-  double std_deviation_;
+  void Reset() { new (this) Stat<ValueType, HighPrecisionValueType>(); }
 
-  void UpdateStat(const T val) {
-    current_value_ = val;
-    values_.push_front(val);
-    while (values_.size() > kNumValues) {
-      values_.pop_back();
-    }
+  bool empty() const { return count_ == 0; }
 
-    T total = 0;
-    for (const T curr_val : values_) {
-      min_value_ = std::min(min_value_, curr_val);
-      max_value_ = std::max(max_value_, curr_val);
-      total += curr_val;
-    }
-    avg_value_ = static_cast<double>(total) / values_.size();
+  ValueType first() const { return first_; }
 
-    double sqr_total = 0.0;
-    for (const T curr_val : values_) {
-      const double delta = avg_value_ - curr_val;
-      sqr_total += delta * delta;
-    }
-    std_deviation_ = std::sqrt(sqr_total / values_.size());
+  ValueType newest() const { return newest_; }
+
+  ValueType max() const { return max_; }
+
+  ValueType min() const { return min_; }
+
+  int64 count() const { return count_; }
+
+  ValueType sum() const { return sum_; }
+
+  HighPrecisionValueType squared_sum() const { return squared_sum_; }
+
+  bool all_same() const { return (count_ == 0 || min_ == max_); }
+
+  HighPrecisionValueType avg() const {
+    return empty() ? std::numeric_limits<ValueType>::quiet_NaN()
+                   : static_cast<HighPrecisionValueType>(sum_) / count_;
   }
 
-  friend std::ostream& operator<<(std::ostream& stream, const Stat<T>& stat) {
-    stream << "curr=" << stat.current_value_ << " min=" << stat.min_value_
-           << " max=" << stat.max_value_
-           << " avg=" << static_cast<int64>(stat.avg_value_)
-           << " stddev=" << static_cast<int64>(stat.std_deviation_);
+  ValueType std_deviation() const {
+    return all_same() ? 0 : sqrt(squared_sum_ / count_ - avg() * avg());
+  }
+
+  void OutputToStream(std::ostream* stream) const {
+    if (empty()) {
+      *stream << "count=0";
+    } else if (all_same()) {
+      *stream << "count=" << count_ << " curr=" << newest_;
+      if (count_ > 1) *stream << "(all same)";
+    } else {
+      *stream << "count=" << count_ << " first=" << first_
+              << " curr=" << newest_ << " min=" << min_ << " max=" << max_
+              << " avg=" << avg() << " std=" << std_deviation();
+    }
+  }
+
+  friend std::ostream& operator<<(std::ostream& stream,
+                                  const Stat<ValueType>& stat) {
+    stat.OutputToStream(&stream);
     return stream;
   }
+
+ private:
+  ValueType first_ = 0;
+  ValueType newest_ = 0;
+  ValueType max_ = std::numeric_limits<ValueType>::min();
+  ValueType min_ = std::numeric_limits<ValueType>::max();
+  int64 count_ = 0;
+  ValueType sum_ = 0;
+  HighPrecisionValueType squared_sum_ = 0;
 };
 
-// A class intended to make performance analysis easier by collecting StepStats
-// and showing in an easily understandable format where CPU time is being spent.
-// See tensorflow/examples/android/jni/tensorflow_jni.cc for an example usage.
+// Used to control the output of the statistics summarizer;
+class StatSummarizerOptions {
+ public:
+  StatSummarizerOptions()
+      : show_run_order(true),
+        run_order_limit(0),
+        show_time(true),
+        time_limit(10),
+        show_memory(true),
+        memory_limit(10),
+        show_type(true),
+        show_summary(true) {}
+
+  bool show_run_order;
+  int run_order_limit;
+  bool show_time;
+  int time_limit;
+  bool show_memory;
+  int memory_limit;
+  bool show_type;
+  bool show_summary;
+};
+
+// A StatSummarizer assists in performance analysis of Graph executions.
+//
+// It summarizes time spent executing (on GPU/CPU), memory used etc. across
+// multiple executions of a single Graph from the StepStats collected during
+// graph execution.
+//
+// See tensorflow/tools/benchmark/benchmark_model.cc for an example usage.
 class StatSummarizer {
  public:
+  enum SortingMetric {
+    BY_NAME,
+    BY_RUN_ORDER,
+    BY_TIME,
+    BY_MEMORY,
+    BY_TYPE,
+  };
+
+  explicit StatSummarizer(const StatSummarizerOptions& options);
+
+  // Deprecated: Use StatSummarizer(const StatSummarizerOptions&) instead. The
+  // GraphDef is not needed by the StatSummarizer.
   explicit StatSummarizer(const tensorflow::GraphDef& tensorflow_graph);
+
+  ~StatSummarizer();
 
   // Adds another run's StepStats output to the aggregate counts.
   void ProcessStepStats(const StepStats& step_stats);
 
-  // Prints all the accumulated runtime stats in a tab-separated format which
-  // can be pasted into a spreadsheet for further analysis.
-  void PrintStepStats();
+  // Returns a string detailing the accumulated runtime stats in a tab-separated
+  // format which can be pasted into a spreadsheet for further analysis.
+  std::string GetOutputString() const;
 
-  void Reset() {
-    num_runs_ = 0;
+  std::string ShortSummary() const;
 
-    run_total_us_.Reset();
+  // Prints the string returned by GetOutputString().
+  void PrintStepStats() const;
 
-    timing_total_us_ = 0;
-    timing_totals_.clear();
-  }
+  // Prints the output tensor sizes and types for each node.
+  void PrintOutputs() const;
+
+  void ComputeStatsByType(std::map<string, int64>* node_type_map_count,
+                          std::map<string, int64>* node_type_map_time,
+                          std::map<string, int64>* node_type_map_memory,
+                          std::map<string, int64>* node_type_map_times_called,
+                          int64* accumulated_us) const;
+
+  std::string GetStatsByNodeType() const;
+
+  std::string GetStatsByMetric(const string& title,
+                               SortingMetric sorting_metric,
+                               int num_stats) const;
+
+  void Reset();
+
+  // Returns number of runs.
+  int num_runs() const { return run_total_us_.count(); }
+
+  // Returns stats of total microseconds spent by all nodes in each run.
+  const Stat<int64>& run_total_us() const { return run_total_us_; }
 
  private:
-  void PrintHeaders();
-  void PrintColumns(const char* name, const char* op, const double time_ms,
-                    const double percentage);
+  struct Detail {
+    string name;
+    string type;
+    int64 run_order;
+    Stat<int64> start_us;
+    Stat<int64> rel_end_us;
+    Stat<int64> mem_used;
+    std::vector<TensorDescription> outputs;
+    int64 times_called;
+  };
+
+  void Validate(const Detail* detail, const NodeExecStats& ns) const;
+
+  void OrderNodesByMetric(SortingMetric sorting_metric,
+                          std::vector<const Detail*>* details) const;
+
+  std::string HeaderString(const string& title) const;
+  std::string ColumnString(const Detail& detail,
+                           const int64 cumulative_stat_on_node,
+                           const Stat<int64>& stat) const;
 
   Stat<int64> run_total_us_;
+  Stat<int64> memory_;
 
-  int num_runs_ = 0;
-  int64 timing_total_us_ = 0;
-  std::vector<string> nodes_;
-  std::map<string, int64> timing_totals_;
-  std::map<string, string> node_types_;
+  std::map<std::string, Detail> details_;
+  StatSummarizerOptions options_;
 };
 
 }  // namespace tensorflow
